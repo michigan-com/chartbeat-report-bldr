@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/cenkalti/backoff"
@@ -16,23 +17,38 @@ import (
 )
 
 var errResultsNotReady = errors.New("results not ready yet")
-
-const timeFmt = "2006-01-02 15:04"
+var ErrResultSetTooLarge = errors.New("result set too large")
 
 type Row struct {
-	Time   time.Time
-	URL    string
-	Visits int
+	Time time.Time
+	URL  string
+
+	Visits                int
+	Uniques               int
+	QualityPageViews      int
+	LoyalVisitorPageViews int
+	TotalEngagedTime      int
 }
 
 type Client struct {
 	APIKey string
 }
 
-func (cbc *Client) Load(domain string, startDay, endDay string, limit int, maxLoadTime time.Duration, f func(row Row), logger *log.Logger) error {
+type Filter struct {
+	StartDay string
+	EndDay   string
+	Limit    int
+	Metrics  []Metric
+}
+
+func (cbc *Client) Load(domain string, filt Filter, maxLoadTime time.Duration, f func(row Row), logger *log.Logger) error {
 	boff := backoff.NewExponentialBackOff()
 	boff.InitialInterval = 100 * time.Millisecond
 	boff.MaxElapsedTime = maxLoadTime
+
+	if len(filt.Metrics) == 0 {
+		filt.Metrics = []Metric{PageViews}
+	}
 
 	var queryID string
 	attempt := 1
@@ -40,7 +56,7 @@ func (cbc *Client) Load(domain string, startDay, endDay string, limit int, maxLo
 	err := backoff.RetryNotify(func() error {
 		logger.Printf("Submitting report builder request for %s (attempt %d)...", domain, attempt)
 		var err error
-		queryID, err = cbc.submit(domain, startDay, endDay, limit)
+		queryID, err = cbc.submit(domain, filt)
 		return err
 	}, boff, func(err error, delay time.Duration) {
 		logger.Printf("WARNING: Submit op failed, sleeping for %.1f: %v", delay.Seconds(), err)
@@ -49,29 +65,17 @@ func (cbc *Client) Load(domain string, startDay, endDay string, limit int, maxLo
 		return errors.Wrap(err, "submit op")
 	}
 
-	decodeRow := func(rec []string) error {
-		if len(rec) != 3 {
-			panic("expected 3 columns")
-		}
-		tm, err := time.ParseInLocation(timeFmt, rec[0], time.UTC)
-		if err != nil {
-			return errors.Errorf("cannot parse time %#v", rec[0])
-		}
-		url := "http://" + domain + rec[1]
-		visits, err := strconv.Atoi(rec[2])
-		if err != nil {
-			return errors.Errorf("cannot parse visits count %#v", rec[2])
-		}
-
-		f(Row{tm, url, visits})
-		return nil
-	}
-
 	attempt = 1
 	boff.Reset()
+	var finalErr error
 	err = backoff.RetryNotify(func() error {
 		logger.Printf("Checking status of report builder query %s for %s (attempt %d)...", queryID, domain, attempt)
-		return cbc.query(domain, queryID, decodeRow)
+		err := cbc.query(domain, queryID, len(filt.Metrics), f)
+		if err == ErrResultSetTooLarge {
+			finalErr = err
+			return nil
+		}
+		return err
 	}, boff, func(err error, delay time.Duration) {
 		if err == errResultsNotReady {
 			logger.Printf("Results not ready yet, sleeping for %.1f sec.", delay.Seconds())
@@ -84,22 +88,27 @@ func (cbc *Client) Load(domain string, startDay, endDay string, limit int, maxLo
 		return errors.Wrap(err, "fetch op")
 	}
 
-	return nil
+	return finalErr
 }
 
-func (cbc *Client) submit(domain string, startDay, endDay string, limit int) (string, error) {
+func (cbc *Client) submit(domain string, filt Filter) (string, error) {
+	var mm []string
+	for _, m := range filt.Metrics {
+		mm = append(mm, string(m))
+	}
+
 	params := make(url.Values)
 	params.Set("host", domain)
 	params.Set("apikey", cbc.APIKey)
-	params.Set("metrics", "page_views")
+	params.Set("metrics", strings.Join(mm, ","))
 	params.Set("dimensions", "path,tz_day,tz_hour,tz_minute")
 	params.Set("sort_column", "page_views")
 	params.Set("sort_order", "desc")
 	params.Set("pagetype", "Article")
-	params.Set("start", startDay)
-	params.Set("end", endDay)
-	if limit > 0 {
-		params.Set("limit", strconv.Itoa(limit))
+	params.Set("start", filt.StartDay)
+	params.Set("end", filt.EndDay)
+	if filt.Limit > 0 {
+		params.Set("limit", strconv.Itoa(filt.Limit))
 	}
 
 	var resp submitResponse
@@ -115,7 +124,7 @@ func (cbc *Client) submit(domain string, startDay, endDay string, limit int) (st
 	return resp.QueryID, nil
 }
 
-func (cbc *Client) query(domain string, queryID string, f func([]string) error) error {
+func (cbc *Client) query(domain string, queryID string, nmetrics int, f func(row Row)) error {
 	params := make(url.Values)
 	params.Set("host", domain)
 	params.Set("apikey", cbc.APIKey)
@@ -130,6 +139,9 @@ func (cbc *Client) query(domain string, queryID string, f func([]string) error) 
 	if resp.StatusCode == http.StatusInternalServerError {
 		return errResultsNotReady
 	}
+	if resp.StatusCode == http.StatusGatewayTimeout {
+		return ErrResultSetTooLarge
+	}
 
 	err = httputil.VerifyResponse(resp, httputil.CSVContentType)
 	if err != nil {
@@ -138,8 +150,12 @@ func (cbc *Client) query(domain string, queryID string, f func([]string) error) 
 
 	// handle rows
 	rdr := csv.NewReader(resp.Body)
-	rdr.FieldsPerRecord = 3
+	numFields := 2 + nmetrics
 	recno := 0
+
+	var columns = make([]columnFunc, 0, numFields)
+	var colNames = make([]string, 0, numFields)
+
 	for {
 		record, err := rdr.Read()
 		if err == io.EOF {
@@ -149,11 +165,39 @@ func (cbc *Client) query(domain string, queryID string, f func([]string) error) 
 			return errors.Wrapf(err, "failed to decode CSV on data row %d", recno)
 		}
 
-		if recno > 0 {
-			err = f(record)
-			if err != nil {
-				return errors.Wrapf(err, "record %d", recno)
+		if recno == 0 {
+			if len(record) == 2 && record[0] == "Error" {
+				msg := record[1]
+				if msg == "No results found" {
+					break
+				} else {
+					return errors.Errorf("chartbeat error: %s", msg)
+				}
+			} else if len(record) != numFields {
+				return errors.Errorf("wrong number of fields in response, got %d, wanted %d", len(record), numFields)
 			}
+
+			// log.Printf("columns = %#v", record)
+			colNames = record
+			for _, column := range record {
+				proc := newColumnProcessor(domain, column)
+				columns = append(columns, proc)
+			}
+		} else {
+			if len(record) != numFields {
+				panic("len(record) mismatch")
+			}
+
+			var row Row
+			for i, proc := range columns {
+				v := record[i]
+				err = proc(v, &row)
+				if err != nil {
+					return errors.Wrapf(err, "record %d, column %d %v, value %#v", recno, i+1, colNames[i], v)
+				}
+			}
+
+			f(row)
 		}
 
 		recno++

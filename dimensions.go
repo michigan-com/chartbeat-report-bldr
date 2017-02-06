@@ -18,3 +18,9 @@ const (
 	Section                = "section"
 	Author                 = "author"
 )
+
+const (
+	TZTimeCol     = "tz_time"
+	UTCTimeCol    = "utc_time"
+	ClientTimeCol = "client_time"
+)
