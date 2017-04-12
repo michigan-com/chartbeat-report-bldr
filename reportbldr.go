@@ -2,8 +2,8 @@ package chartbeatreportbldr
 
 import (
 	"encoding/csv"
+	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -13,11 +13,16 @@ import (
 	"github.com/cenkalti/backoff"
 	"github.com/pkg/errors"
 
+	"github.com/andreyvit/date"
 	"github.com/michigan-com/sentient/httputil"
 )
 
 var errResultsNotReady = errors.New("results not ready yet")
 var ErrResultSetTooLarge = errors.New("result set too large")
+
+type Printfable interface {
+	Printf(format string, v ...interface{})
+}
 
 type Row struct {
 	Time time.Time
@@ -35,60 +40,168 @@ type Client struct {
 }
 
 type Filter struct {
-	StartDay string
-	EndDay   string
-	Limit    int
-	Metrics  []Metric
+	Start date.Date
+	End   date.Date
+
+	Limit   int
+	Metrics []Metric
+
+	IgnoreTime bool
 }
 
-func (cbc *Client) Load(domain string, filt Filter, maxLoadTime time.Duration, f func(row Row), logger *log.Logger) error {
-	boff := backoff.NewExponentialBackOff()
-	boff.InitialInterval = 100 * time.Millisecond
-	boff.MaxElapsedTime = maxLoadTime
+type Chunk struct {
+	Start date.Date
+	End   date.Date
+
+	// Ordinal is a number of this chunk, from 1 to EstimatedCount
+	Ordinal int
+
+	// EstimatedCount is total expected number of chunks if the chunk size does not change
+	EstimatedCount int
+
+	// Size is the current chunk size
+	Size int
+}
+
+func (c Chunk) String() string {
+	return fmt.Sprintf("chunk %d of %d (from %s to %s, chunk size %d)", c.Ordinal, c.EstimatedCount, c.Start.String(), c.End.String(), c.Size)
+}
+
+type LoadOptions struct {
+	MaxLoadTime time.Duration
+
+	Log func(s string)
+
+	InitialChunkSize     int
+	ChunkSizeAfterNoData int
+	OptimalRows          int
+}
+
+func (cbc *Client) Load(domain string, filt Filter, options LoadOptions, f func(row Row) error) error {
+	daysPerChunk := options.InitialChunkSize
+	if daysPerChunk == 0 {
+		daysPerChunk = 1
+	}
+	if options.OptimalRows == 0 {
+		options.OptimalRows = 800000
+	}
+	if options.ChunkSizeAfterNoData == 0 {
+		options.ChunkSizeAfterNoData = 7
+	}
 
 	if len(filt.Metrics) == 0 {
 		filt.Metrics = []Metric{PageViews}
 	}
 
+	chunkIdx := 0
+	chunkStart := filt.Start
+	end := filt.End
+	for !chunkStart.After(filt.End) {
+		chunk, nextChunkStart, remChunks := date.NextChunk(chunkStart, end, daysPerChunk)
+
+		chunkInfo := Chunk{
+			Start:          chunk.Start,
+			End:            chunk.End,
+			Size:           daysPerChunk,
+			Ordinal:        chunkIdx + 1,
+			EstimatedCount: chunkIdx + 1 + remChunks,
+		}
+		chunkInfoStr := chunkInfo.String()
+
+		var log func(s string)
+		if options.Log != nil {
+			log = func(s string) {
+				options.Log(chunkInfoStr + ": " + s)
+			}
+		}
+
+		boff := backoff.NewExponentialBackOff()
+		boff.InitialInterval = 100 * time.Millisecond
+		boff.MaxElapsedTime = options.MaxLoadTime
+
+		err, rows := cbc.loadChunk(domain, filt, chunkInfo, boff, log, f)
+		if err == ErrResultSetTooLarge {
+			if log != nil {
+				log("result set too large, retrying with chunk size of 1")
+			}
+			daysPerChunk = 1
+			continue
+		} else if err != nil {
+			return err
+		}
+
+		if rows == 0 {
+			daysPerChunk = options.ChunkSizeAfterNoData
+		} else if rows < options.OptimalRows/2 {
+			daysPerChunk = daysPerChunk * 2
+		}
+
+		chunkIdx++
+		chunkStart = nextChunkStart
+	}
+
+	return nil
+}
+
+func (cbc *Client) loadChunk(domain string, filt Filter, chunk Chunk, boff backoff.BackOff, log func(s string), f func(row Row) error) (error, int) {
+	filt.Start = chunk.Start
+	filt.End = chunk.End
+
 	var queryID string
 	attempt := 1
 	boff.Reset()
 	err := backoff.RetryNotify(func() error {
-		logger.Printf("Submitting report builder request for %s (attempt %d)...", domain, attempt)
+		if log != nil {
+			log(fmt.Sprintf("submitting request (attempt %d)", attempt))
+		}
 		var err error
 		queryID, err = cbc.submit(domain, filt)
 		return err
 	}, boff, func(err error, delay time.Duration) {
-		logger.Printf("WARNING: Submit op failed, sleeping for %.1f: %v", delay.Seconds(), err)
+		if log != nil {
+			log(fmt.Sprintf("submit failed, sleeping for %.1f: %v", delay.Seconds(), err))
+		}
 	})
 	if err != nil {
-		return errors.Wrap(err, "submit op")
+		return errors.Wrap(err, "submit op"), 0
 	}
 
 	attempt = 1
 	boff.Reset()
 	var finalErr error
+	var finalRows int
 	err = backoff.RetryNotify(func() error {
-		logger.Printf("Checking status of report builder query %s for %s (attempt %d)...", queryID, domain, attempt)
-		err := cbc.query(domain, queryID, len(filt.Metrics), f)
+		if log != nil {
+			log(fmt.Sprintf("loading results (attempt %d)", attempt))
+		}
+		err, rows, isBreak := cbc.query(domain, queryID, filt, f)
+		finalRows = rows
 		if err == ErrResultSetTooLarge {
+			finalErr = err
+			return nil
+		}
+		if isBreak {
 			finalErr = err
 			return nil
 		}
 		return err
 	}, boff, func(err error, delay time.Duration) {
 		if err == errResultsNotReady {
-			logger.Printf("Results not ready yet, sleeping for %.1f sec.", delay.Seconds())
+			if log != nil {
+				log(fmt.Sprintf("results not ready yet (attempt %d), sleeping for %.1f sec.", attempt, delay.Seconds()))
+			}
 		} else {
-			logger.Printf("WARNING: Status check failed, sleeping for %.1f: %v", delay.Seconds(), err)
+			if log != nil {
+				log(fmt.Sprintf("loading failed (attempt %d), sleeping for %.1f: %v", attempt, delay.Seconds(), err))
+			}
 		}
 		attempt++
 	})
 	if err != nil {
-		return errors.Wrap(err, "fetch op")
+		return errors.Wrap(err, "fetch op"), finalRows
 	}
 
-	return finalErr
+	return finalErr, finalRows
 }
 
 func (cbc *Client) submit(domain string, filt Filter) (string, error) {
@@ -101,12 +214,16 @@ func (cbc *Client) submit(domain string, filt Filter) (string, error) {
 	params.Set("host", domain)
 	params.Set("apikey", cbc.APIKey)
 	params.Set("metrics", strings.Join(mm, ","))
-	params.Set("dimensions", "path,tz_day,tz_hour,tz_minute")
+	if filt.IgnoreTime {
+		params.Set("dimensions", "path")
+	} else {
+		params.Set("dimensions", "path,tz_day,tz_hour,tz_minute")
+	}
 	params.Set("sort_column", "page_views")
 	params.Set("sort_order", "desc")
 	params.Set("pagetype", "Article")
-	params.Set("start", filt.StartDay)
-	params.Set("end", filt.EndDay)
+	params.Set("start", filt.Start.String())
+	params.Set("end", filt.End.String())
 	if filt.Limit > 0 {
 		params.Set("limit", strconv.Itoa(filt.Limit))
 	}
@@ -124,7 +241,7 @@ func (cbc *Client) submit(domain string, filt Filter) (string, error) {
 	return resp.QueryID, nil
 }
 
-func (cbc *Client) query(domain string, queryID string, nmetrics int, f func(row Row)) error {
+func (cbc *Client) query(domain string, queryID string, filt Filter, f func(row Row) error) (error, int, bool) {
 	params := make(url.Values)
 	params.Set("host", domain)
 	params.Set("apikey", cbc.APIKey)
@@ -132,37 +249,41 @@ func (cbc *Client) query(domain string, queryID string, nmetrics int, f func(row
 
 	resp, err := httputil.GetRaw("http://chartbeat.com/query/v2/fetch/", params, nil)
 	if err != nil {
-		return err
+		return err, 0, false
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode == http.StatusInternalServerError {
-		return errResultsNotReady
+	if resp.StatusCode == http.StatusInternalServerError || resp.StatusCode == http.StatusServiceUnavailable {
+		return errResultsNotReady, 0, false
 	}
 	if resp.StatusCode == http.StatusGatewayTimeout {
-		return ErrResultSetTooLarge
+		return ErrResultSetTooLarge, 0, false
 	}
 
 	err = httputil.VerifyResponse(resp, httputil.CSVContentType)
 	if err != nil {
-		return err
+		return err, 0, false
 	}
 
 	// handle rows
 	rdr := csv.NewReader(resp.Body)
-	numFields := 2 + nmetrics
+	numFields := 1 + len(filt.Metrics)
+	if !filt.IgnoreTime {
+		numFields++
+	}
 	recno := 0
 
 	var columns = make([]columnFunc, 0, numFields)
 	var colNames = make([]string, 0, numFields)
 
+	var rows int
 	for {
 		record, err := rdr.Read()
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
-			return errors.Wrapf(err, "failed to decode CSV on data row %d", recno)
+			return errors.Wrapf(err, "failed to decode CSV on data row %d", recno), rows, false
 		}
 
 		if recno == 0 {
@@ -171,10 +292,10 @@ func (cbc *Client) query(domain string, queryID string, nmetrics int, f func(row
 				if msg == "No results found" {
 					break
 				} else {
-					return errors.Errorf("chartbeat error: %s", msg)
+					return errors.Errorf("chartbeat error: %s", msg), rows, false
 				}
 			} else if len(record) != numFields {
-				return errors.Errorf("wrong number of fields in response, got %d, wanted %d", len(record), numFields)
+				return errors.Errorf("wrong number of fields in response, got %d, wanted %d", len(record), numFields), rows, false
 			}
 
 			// log.Printf("columns = %#v", record)
@@ -193,17 +314,21 @@ func (cbc *Client) query(domain string, queryID string, nmetrics int, f func(row
 				v := record[i]
 				err = proc(v, &row)
 				if err != nil {
-					return errors.Wrapf(err, "record %d, column %d %v, value %#v", recno, i+1, colNames[i], v)
+					return errors.Wrapf(err, "record %d, column %d %v, value %#v", recno, i+1, colNames[i], v), rows, false
 				}
 			}
 
-			f(row)
+			rows++
+			err := f(row)
+			if err != nil {
+				return err, rows, true
+			}
 		}
 
 		recno++
 	}
 
-	return nil
+	return nil, rows, false
 }
 
 type submitResponse struct {
