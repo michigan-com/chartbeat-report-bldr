@@ -1,5 +1,9 @@
 package chartbeatreportbldr
 
+import (
+	"strings"
+)
+
 type Dimension string
 
 const (
@@ -19,8 +23,45 @@ const (
 	Author                 = "author"
 )
 
+type TimeGroup struct {
+	DayDimension    Dimension
+	HourDimension   Dimension
+	MinuteDimension Dimension
+
+	TimeCol string
+}
+
 const (
 	TZTimeCol     = "tz_time"
 	UTCTimeCol    = "utc_time"
 	ClientTimeCol = "client_time"
 )
+
+var (
+	TZTimeGroup = TimeGroup{
+		DayDimension:    TZDay,
+		HourDimension:   TZHour,
+		MinuteDimension: TZMinute,
+		TimeCol:         TZTimeCol,
+	}
+	UTCTimeGroup = TimeGroup{
+		DayDimension:    UTCDay,
+		HourDimension:   UTCHour,
+		MinuteDimension: UTCMinute,
+		TimeCol:         UTCTimeCol,
+	}
+	ClientTimeGroup = TimeGroup{
+		DayDimension:    ClientDay,
+		HourDimension:   ClientHour,
+		MinuteDimension: ClientMinute,
+		TimeCol:         ClientTimeCol,
+	}
+)
+
+func joinDimensions(dims []Dimension, sep string) string {
+	var ss []string
+	for _, dim := range dims {
+		ss = append(ss, string(dim))
+	}
+	return strings.Join(ss, sep)
+}

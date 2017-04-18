@@ -46,7 +46,9 @@ type Filter struct {
 	Limit   int
 	Metrics []Metric
 
-	IgnoreTime bool
+	TimeResolution TimeResolution
+
+	Path string
 }
 
 type Chunk struct {
@@ -78,6 +80,12 @@ type LoadOptions struct {
 }
 
 func (cbc *Client) Load(domain string, filt Filter, options LoadOptions, f func(row Row) error) error {
+	if filt.Start.IsZero() || filt.End.IsZero() || options.InitialChunkSize < 0 {
+		// cannot do chunked load if the date range isn't specified
+		err, _ := cbc.loadSingleChunk(domain, filt, options, f)
+		return err
+	}
+
 	daysPerChunk := options.InitialChunkSize
 	if daysPerChunk == 0 {
 		daysPerChunk = 1
@@ -115,11 +123,11 @@ func (cbc *Client) Load(domain string, filt Filter, options LoadOptions, f func(
 			}
 		}
 
-		boff := backoff.NewExponentialBackOff()
-		boff.InitialInterval = 100 * time.Millisecond
-		boff.MaxElapsedTime = options.MaxLoadTime
+		chunkFilt := filt
+		chunkFilt.Start = chunk.Start
+		chunkFilt.End = chunk.End
 
-		err, rows := cbc.loadChunk(domain, filt, chunkInfo, boff, log, f)
+		err, rows := cbc.loadSingleChunk(domain, chunkFilt, LoadOptions{MaxLoadTime: options.MaxLoadTime, Log: log}, f)
 		if err == ErrResultSetTooLarge {
 			if log != nil {
 				log("result set too large, retrying with chunk size of 1")
@@ -143,23 +151,24 @@ func (cbc *Client) Load(domain string, filt Filter, options LoadOptions, f func(
 	return nil
 }
 
-func (cbc *Client) loadChunk(domain string, filt Filter, chunk Chunk, boff backoff.BackOff, log func(s string), f func(row Row) error) (error, int) {
-	filt.Start = chunk.Start
-	filt.End = chunk.End
+func (cbc *Client) loadSingleChunk(domain string, filt Filter, options LoadOptions, f func(row Row) error) (error, int) {
+	boff := backoff.NewExponentialBackOff()
+	boff.InitialInterval = 100 * time.Millisecond
+	boff.MaxElapsedTime = options.MaxLoadTime
 
 	var queryID string
 	attempt := 1
 	boff.Reset()
 	err := backoff.RetryNotify(func() error {
-		if log != nil {
-			log(fmt.Sprintf("submitting request (attempt %d)", attempt))
+		if options.Log != nil {
+			options.Log(fmt.Sprintf("submitting request (attempt %d)", attempt))
 		}
 		var err error
 		queryID, err = cbc.submit(domain, filt)
 		return err
 	}, boff, func(err error, delay time.Duration) {
-		if log != nil {
-			log(fmt.Sprintf("submit failed, sleeping for %.1f: %v", delay.Seconds(), err))
+		if options.Log != nil {
+			options.Log(fmt.Sprintf("submit failed, sleeping for %.1f: %v", delay.Seconds(), err))
 		}
 	})
 	if err != nil {
@@ -171,8 +180,8 @@ func (cbc *Client) loadChunk(domain string, filt Filter, chunk Chunk, boff backo
 	var finalErr error
 	var finalRows int
 	err = backoff.RetryNotify(func() error {
-		if log != nil {
-			log(fmt.Sprintf("loading results (attempt %d)", attempt))
+		if options.Log != nil {
+			options.Log(fmt.Sprintf("loading results (attempt %d)", attempt))
 		}
 		err, rows, isBreak := cbc.query(domain, queryID, filt, f)
 		finalRows = rows
@@ -187,12 +196,12 @@ func (cbc *Client) loadChunk(domain string, filt Filter, chunk Chunk, boff backo
 		return err
 	}, boff, func(err error, delay time.Duration) {
 		if err == errResultsNotReady {
-			if log != nil {
-				log(fmt.Sprintf("results not ready yet (attempt %d), sleeping for %.1f sec.", attempt, delay.Seconds()))
+			if options.Log != nil {
+				options.Log(fmt.Sprintf("results not ready yet (attempt %d), sleeping for %.1f sec.", attempt, delay.Seconds()))
 			}
 		} else {
-			if log != nil {
-				log(fmt.Sprintf("loading failed (attempt %d), sleeping for %.1f: %v", attempt, delay.Seconds(), err))
+			if options.Log != nil {
+				options.Log(fmt.Sprintf("loading failed (attempt %d), sleeping for %.1f: %v", attempt, delay.Seconds(), err))
 			}
 		}
 		attempt++
@@ -214,18 +223,24 @@ func (cbc *Client) submit(domain string, filt Filter) (string, error) {
 	params.Set("host", domain)
 	params.Set("apikey", cbc.APIKey)
 	params.Set("metrics", strings.Join(mm, ","))
-	if filt.IgnoreTime {
-		params.Set("dimensions", "path")
-	} else {
-		params.Set("dimensions", "path,tz_day,tz_hour,tz_minute")
-	}
+
+	dimensions := []Dimension{Path}
+	dimensions = append(dimensions, filt.TimeResolution.PickDimensions(TZTimeGroup)...)
+	params.Set("dimensions", joinDimensions(dimensions, ","))
 	params.Set("sort_column", "page_views")
 	params.Set("sort_order", "desc")
 	params.Set("pagetype", "Article")
-	params.Set("start", filt.Start.String())
-	params.Set("end", filt.End.String())
+	if !filt.Start.IsZero() {
+		params.Set("start", filt.Start.String())
+	}
+	if !filt.End.IsZero() {
+		params.Set("end", filt.End.String())
+	}
 	if filt.Limit > 0 {
 		params.Set("limit", strconv.Itoa(filt.Limit))
+	}
+	if filt.Path != "" {
+		params.Set("path", filt.Path)
 	}
 
 	var resp submitResponse
@@ -268,7 +283,7 @@ func (cbc *Client) query(domain string, queryID string, filt Filter, f func(row 
 	// handle rows
 	rdr := csv.NewReader(resp.Body)
 	numFields := 1 + len(filt.Metrics)
-	if !filt.IgnoreTime {
+	if filt.TimeResolution != TimeResolutionNone {
 		numFields++
 	}
 	recno := 0
