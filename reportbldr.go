@@ -225,7 +225,7 @@ func (cbc *Client) submit(domain string, filt Filter) (string, error) {
 	params.Set("metrics", strings.Join(mm, ","))
 
 	dimensions := []Dimension{Path}
-	dimensions = append(dimensions, filt.TimeResolution.PickDimensions(TZTimeGroup)...)
+	dimensions = append(dimensions, filt.TimeResolution.PickDimensions(UTCTimeGroup)...)
 	params.Set("dimensions", joinDimensions(dimensions, ","))
 	params.Set("sort_column", "page_views")
 	params.Set("sort_order", "desc")
